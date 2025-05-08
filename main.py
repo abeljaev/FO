@@ -4,10 +4,9 @@ import json
 import pandas as pd
 import numpy as np
 import fiftyone as fo
-import fiftyone.zoo as foz  # Используем для foz.load_zoo_model
+import fiftyone.zoo as foz
 from loguru import logger
-
-# PIL, torch, transformers импортируются неявно через fiftyone.zoo или fiftyone.core.models
+from fiftyone import F  # Для более сложных проверок полей, если понадобится
 
 # --- НАСТРОЙКИ ЛОГИРОВАНИЯ (Минимальные) ---
 logger.remove()
@@ -47,7 +46,7 @@ SKIP_CLASSES_FOR_IOU_EVAL = {
 INCLUSION_THRESHOLD_GT_COVERED = 0.8
 
 
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (Без изменений) ---
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 def get_group_for_label(label: str) -> str:
     for group, labels in CLASSES_GROUPS.items():
         if label in labels:
@@ -91,7 +90,7 @@ def calculate_intersection_area(bbox1_abs, bbox2_abs):
     return (x_right - x_left) * (y_bottom - y_top)
 
 
-# --- КАСТОМНАЯ ОЦЕНКА ПО ВХОЖДЕНИЮ (Без изменений) ---
+# --- КАСТОМНАЯ ОЦЕНКА ПО ВХОЖДЕНИЮ ---
 def evaluate_by_inclusion(
     dataset, gt_field="ground_truth", pred_field="predictions", gt_covered_threshold=0.8
 ):
@@ -161,14 +160,13 @@ def evaluate_by_inclusion(
     logger.info(f"Оценка по вхождению для '{dataset.name}' завершена.")
 
 
-# --- ВЫЧИСЛЕНИЕ ЭМБЕДДИНГОВ ПАТЧЕЙ (Возвращаем foz.load_zoo_model) ---
+# --- ВЫЧИСЛЕНИЕ ЭМБЕДДИНГОВ ПАТЧЕЙ ---
 def compute_and_save_patch_embeddings(
     dataset_or_view,
-    zoo_model_name,  # Имя модели из FiftyOne Zoo (например, "dinov2-vitb14-torch")
+    zoo_model_name,
     patches_field="ground_truth",
-    embeddings_storage_field="embeddings",
+    embeddings_field_on_detection="embedding",
 ):
-    final_embeddings_field = f"{patches_field}_{embeddings_storage_field}"
     if not dataset_or_view.has_sample_field(patches_field):
         logger.warning(
             f"Поле '{patches_field}' не найдено в '{dataset_or_view.name}'. Пропуск эмбеддингов."
@@ -176,9 +174,11 @@ def compute_and_save_patch_embeddings(
         return
 
     logger.info(
-        f"Вычисление эмбеддингов для '{patches_field}' в '{dataset_or_view.name}' используя модель Zoo: '{zoo_model_name}'."
+        f"Вычисление эмбеддингов для объектов из '{patches_field}' в '{dataset_or_view.name}' используя модель Zoo: '{zoo_model_name}'."
     )
-    logger.info(f"Результат будет сохранен в поле: '{final_embeddings_field}'.")
+    logger.info(
+        f"Результат будет сохранен в поле '{embeddings_field_on_detection}' каждого объекта Detection из поля '{patches_field}'."
+    )
 
     try:
         detections_exist = any(
@@ -191,18 +191,13 @@ def compute_and_save_patch_embeddings(
             )
             return
 
-        # --- Загружаем модель через foz.load_zoo_model ---
-        # Это должно автоматически загрузить модель из сети, если ее нет в кэше.
-        # Параметры, такие как `model_name_or_path`, здесь не нужны,
-        # так как мы используем стандартное имя из Zoo.
         model_instance = foz.load_zoo_model(zoo_model_name)
-        # -------------------------------------------------
 
         dataset_or_view.compute_embeddings(
-            model_instance,  # Передаем загруженный экземпляр модели
-            embeddings_field=final_embeddings_field,
+            model_instance,
+            embeddings_field=embeddings_field_on_detection,
             patches_field=patches_field,
-            batch_size=16,
+            batch_size=4,
         )
 
         logger.info(f"Эмбеддинги успешно вычислены для '{dataset_or_view.name}'.")
@@ -213,12 +208,11 @@ def compute_and_save_patch_embeddings(
             f"Критическая ошибка при вычислении эмбеддингов для '{dataset_or_view.name}' с моделью '{zoo_model_name}'."
         )
         logger.error(
-            "Убедитесь, что имя модели ('{zoo_model_name}') корректно для вашего FiftyOne Zoo, "
-            "есть интернет-соединение для загрузки, и все зависимости (torch, transformers, fiftyone-brain) установлены."
+            "Убедитесь, что имя модели ('{zoo_model_name}') корректно, есть интернет, и зависимости установлены."
         )
 
 
-# --- ЗАГРУЗКА ДАННЫХ И СОЗДАНИЕ ДАТАСЕТА ДЛЯ КЛАССА (Без изменений) ---
+# --- ЗАГРУЗКА ДАННЫХ И СОЗДАНИЕ ДАТАСЕТА ДЛЯ КЛАССА ---
 def load_class_dataset_from_csv(csv_file, all_predictions_dict, config_params):
     our_class_name_from_csv = os.path.splitext(os.path.basename(csv_file))[0]
     logger.info(
@@ -335,7 +329,6 @@ def load_class_dataset_from_csv(csv_file, all_predictions_dict, config_params):
     dataset.add_samples(samples)
     logger.info(f"Добавлено {len(samples)} сэмплов в '{dataset_name}'.")
 
-    # Сначала считаем метрики
     if our_class_name_from_csv in config_params["SKIP_CLASSES_FOR_IOU_EVAL"]:
         evaluate_by_inclusion(
             dataset,
@@ -367,14 +360,15 @@ def load_class_dataset_from_csv(csv_file, all_predictions_dict, config_params):
                 f"Пропуск оценки IoU для '{our_class_name_from_csv}': нет GT."
             )
 
-    # Затем считаем эмбеддинги
     if config_params["COMPUTE_GT_EMBEDDINGS"]:
         logger.info(f"Вычисление эмбеддингов GT для '{dataset_name}'...")
         compute_and_save_patch_embeddings(
             dataset,
             zoo_model_name=config_params["ZOO_MODEL_NAME_FOR_EMBEDDINGS"],
             patches_field="ground_truth",
-            embeddings_storage_field=config_params["EMBEDDINGS_FIELD_SUFFIX"],
+            embeddings_field_on_detection=config_params[
+                "EMBEDDINGS_FIELD_NAME_IN_DETECTION"
+            ],
         )
 
     logger.info(f"Обработка '{dataset_name}' завершена.")
@@ -400,8 +394,8 @@ def main():
         "LAUNCH_APP_FOR_EACH": False,
         "COMPUTE_GT_EMBEDDINGS": True,
         "ZOO_MODEL_NAME_FOR_EMBEDDINGS": "dinov2-vitb14-torch",
-        # "ZOO_MODEL_NAME_FOR_EMBEDDINGS": "clip-vit-base32-torch", # Убедитесь, что это имя есть в foz.list_zoo_models()
-        "EMBEDDINGS_FIELD_SUFFIX": "embeddings",
+        # "ZOO_MODEL_NAME_FOR_EMBEDDINGS": "clip-vit-base32-torch",
+        "EMBEDDINGS_FIELD_NAME_IN_DETECTION": "embedding",  # Простое имя поля для эмбеддинга
         "START_PORT": 30082,
     }
 
@@ -413,7 +407,9 @@ def main():
         "IOU_DICT": IOU_DICT,
         "COMPUTE_GT_EMBEDDINGS": APP_CONFIG["COMPUTE_GT_EMBEDDINGS"],
         "ZOO_MODEL_NAME_FOR_EMBEDDINGS": APP_CONFIG["ZOO_MODEL_NAME_FOR_EMBEDDINGS"],
-        "EMBEDDINGS_FIELD_SUFFIX": APP_CONFIG["EMBEDDINGS_FIELD_SUFFIX"],
+        "EMBEDDINGS_FIELD_NAME_IN_DETECTION": APP_CONFIG[
+            "EMBEDDINGS_FIELD_NAME_IN_DETECTION"
+        ],
         "LAUNCH_APP_FOR_EACH": APP_CONFIG["LAUNCH_APP_FOR_EACH"],
     }
 
@@ -438,10 +434,21 @@ def main():
         ds = load_class_dataset_from_csv(csv_f, all_preds, LOADER_PARAMS)
         if ds:
             info = {"name": ds.name, "emb": False}
-            if APP_CONFIG["COMPUTE_GT_EMBEDDINGS"] and ds.has_field(
-                f"ground_truth_{APP_CONFIG['EMBEDDINGS_FIELD_SUFFIX']}"
-            ):
-                info["emb"] = True
+            if APP_CONFIG["COMPUTE_GT_EMBEDDINGS"]:
+                # Проверяем наличие поля у первой детекции первого сэмпла, если есть
+                # Это не 100% гарантия, что все детекции имеют поле, но быстрая проверка
+                first_sample_with_gt = ds.match(
+                    F("ground_truth.detections").length() > 0
+                ).first()
+                if (
+                    first_sample_with_gt
+                    and first_sample_with_gt.ground_truth
+                    and first_sample_with_gt.ground_truth.detections
+                    and APP_CONFIG["EMBEDDINGS_FIELD_NAME_IN_DETECTION"]
+                    in first_sample_with_gt.ground_truth.detections[0]
+                ):
+                    info["emb"] = True
+
             if APP_CONFIG["LAUNCH_APP_FOR_EACH"] and ds.count() > 0:
                 info["app_port"] = LOADER_PARAMS["current_port"]
             loaded_datasets_summary.append(info)
@@ -457,13 +464,16 @@ def main():
             )
             logger.info(msg)
         if loaded_datasets_summary:
+            first_ds_name = loaded_datasets_summary[0]["name"]
+            emb_field_example = APP_CONFIG["EMBEDDINGS_FIELD_NAME_IN_DETECTION"]
             logger.info(f"\nДля просмотра (если App не был запущен):")
             logger.info(f"import fiftyone as fo")
-            logger.info(
-                f"dataset = fo.load_dataset('{loaded_datasets_summary[0]['name']}')"
-            )
+            logger.info(f"dataset = fo.load_dataset('{first_ds_name}')")
             logger.info(
                 f"session = fo.launch_app(dataset, port={APP_CONFIG['START_PORT']})"
+            )
+            logger.info(
+                f"В панели Embeddings -> Plot Type: Labels, Label field: ground_truth.detections, Field with embeddings: {emb_field_example}"
             )
     else:
         logger.warning("Не было создано ни одного датасета.")
