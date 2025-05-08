@@ -26,7 +26,6 @@ from config import (
 )
 
 IOU_DICT = {0.4: "eval_IOU_04", 0.7: "eval_IOU_07"}
-CVAT_LINK = "http://stal-dtl-gpu10:8080"
 
 SKIP = {  # Классы для кастомной оценки по вхождению
     "safety",
