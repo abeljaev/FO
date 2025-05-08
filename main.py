@@ -2,7 +2,13 @@ import os
 import glob
 import json
 import pandas as pd
+import numpy as np  # Для работы с эмбеддингами
 import fiftyone as fo
+import fiftyone.zoo as foz  # Для моделей эмбеддингов
+from sklearn.metrics.pairwise import (
+    euclidean_distances,
+)  # Для Farthest Point Sampling (если понадобится позже)
+
 from config import (
     PATH_TO_SPLIT,
     PATH_TO_PREDICTIONS,
@@ -10,18 +16,17 @@ from config import (
     OUR_TO_MODEL_CLASSES,
     MODEL_MAPPING,
     CLASSES_GROUPS,
-    CVAT_LINK,
 )
 
 IOU_DICT = {0.4: "eval_IOU_04", 0.7: "eval_IOU_07"}
+CVAT_LINK = "http://stal-dtl-gpu10:8080"
 
-# SKIP теперь означает использование кастомной метрики вхождения
 SKIP = {"safety", "no_safety", "chin_strap", "chin_strap_off", "glasses", "glasses_off"}
-
-# Порог для кастомной метрики вхождения (GT должен быть покрыт хотя бы на этот процент)
-INCLUSION_THRESHOLD_GT_COVERED = 0.8  # Например, 80% GT должно быть внутри предикта
+INCLUSION_THRESHOLD_GT_COVERED = 0.8
 
 
+# --- Вспомогательные функции (get_group_for_label, map_classes, map_gt_class) ---
+# (Оставляем как есть из предыдущего варианта)
 def get_group_for_label(label: str) -> str:
     for group, labels in CLASSES_GROUPS.items():
         if label in labels:
@@ -42,9 +47,9 @@ def map_gt_class(gt_label):
     return gt_label
 
 
-# --- Вспомогательные функции для геометрии ---
+# --- Вспомогательные функции для геометрии (get_abs_bbox_from_normalized, calculate_area, calculate_intersection_area) ---
+# (Оставляем как есть из предыдущего варианта)
 def get_abs_bbox_from_normalized(norm_bbox, img_width, img_height):
-    """Преобразует нормализованный bbox [x, y, w, h] в абсолютный [x1, y1, x2, y2]."""
     x, y, w, h = norm_bbox
     x1 = x * img_width
     y1 = y * img_height
@@ -54,86 +59,93 @@ def get_abs_bbox_from_normalized(norm_bbox, img_width, img_height):
 
 
 def calculate_area(bbox_abs):
-    """bbox_abs: [x1, y1, x2, y2]"""
     if None in bbox_abs or bbox_abs[2] < bbox_abs[0] or bbox_abs[3] < bbox_abs[1]:
         return 0.0
     return (bbox_abs[2] - bbox_abs[0]) * (bbox_abs[3] - bbox_abs[1])
 
 
 def calculate_intersection_area(bbox1_abs, bbox2_abs):
-    """bbox_abs: [x1, y1, x2, y2]"""
     x_left = max(bbox1_abs[0], bbox2_abs[0])
     y_top = max(bbox1_abs[1], bbox2_abs[1])
     x_right = min(bbox1_abs[2], bbox2_abs[2])
     y_bottom = min(bbox1_abs[3], bbox2_abs[3])
-
     if x_right < x_left or y_bottom < y_top:
         return 0.0
     return (x_right - x_left) * (y_bottom - y_top)
 
 
-# --- Кастомная оценка по вхождению ---
+# --- Кастомная оценка по вхождению (evaluate_by_inclusion) ---
+# (Оставляем как есть из предыдущего варианта)
 def evaluate_by_inclusion(
     dataset,
     gt_field="ground_truth",
     pred_field="predictions",
     gt_covered_threshold=INCLUSION_THRESHOLD_GT_COVERED,
 ):
-    """
-    Оценивает детекции на основе коэффициента вхождения.
-    Добавляет поля к GT:
-        - 'max_pred_inclusion_in_gt': max(Area(Intersection(GT, Pred)) / Area(GT))
-        - 'gt_covered_by_inclusion': True, если 'max_pred_inclusion_in_gt' >= gt_covered_threshold
-    Добавляет поля к Pred:
-        - 'max_gt_inclusion_in_pred': max(Area(Intersection(GT, Pred)) / Area(Pred))
-        - 'pred_contains_gt_significantly': True, если есть GT, для которого Area(I(GT,P))/Area(GT) высок
-                                            (пока просто сохраним максимальный коэффициент)
-    """
     print(f"Running custom inclusion evaluation for dataset: {dataset.name}")
-    view = dataset.view()  # Process all samples
+    view = dataset.view()
 
     for sample in view.iter_samples(autosave=True, progress=True):
+        # Проверка наличия metadata.width и metadata.height
+        if (
+            sample.metadata is None
+            or sample.metadata.width is None
+            or sample.metadata.height is None
+        ):
+            # print(f"Warning: Sample {sample.filepath} is missing metadata (width/height). Attempting to compute.")
+            try:
+                sample.compute_metadata(overwrite=False)  # Пытаемся вычислить, если нет
+                if (
+                    sample.metadata is None or sample.metadata.width is None
+                ):  # Проверяем снова
+                    print(
+                        f"Error: Could not compute metadata for {sample.filepath}. Skipping inclusion eval for this sample."
+                    )
+                    continue
+            except Exception as e:
+                print(
+                    f"Error computing metadata for {sample.filepath}: {e}. Skipping inclusion eval for this sample."
+                )
+                continue
+
         img_width, img_height = sample.metadata.width, sample.metadata.height
-        if not img_width or not img_height:
-            print(
-                f"Skipping sample {sample.filepath} due to missing metadata (width/height)"
-            )
-            continue
 
-        gt_detections = sample[gt_field].detections if sample[gt_field] else []
-        pred_detections = sample[pred_field].detections if sample[pred_field] else []
+        gt_detections = (
+            sample[gt_field].detections
+            if sample[gt_field] and sample[gt_field].detections
+            else []
+        )
+        pred_detections = (
+            sample[pred_field].detections
+            if sample[pred_field] and sample[pred_field].detections
+            else []
+        )
 
-        # Абсолютные координаты для всех GT и Pred заранее
-        abs_gts = []
-        for gt_det in gt_detections:
-            abs_gts.append(
-                {
-                    "det": gt_det,
-                    "abs_bbox": get_abs_bbox_from_normalized(
-                        gt_det.bounding_box, img_width, img_height
-                    ),
-                }
-            )
+        abs_gts = [
+            {
+                "det": gt_det,
+                "abs_bbox": get_abs_bbox_from_normalized(
+                    gt_det.bounding_box, img_width, img_height
+                ),
+            }
+            for gt_det in gt_detections
+        ]
+        abs_preds = [
+            {
+                "det": pred_det,
+                "abs_bbox": get_abs_bbox_from_normalized(
+                    pred_det.bounding_box, img_width, img_height
+                ),
+            }
+            for pred_det in pred_detections
+        ]
 
-        abs_preds = []
-        for pred_det in pred_detections:
-            abs_preds.append(
-                {
-                    "det": pred_det,
-                    "abs_bbox": get_abs_bbox_from_normalized(
-                        pred_det.bounding_box, img_width, img_height
-                    ),
-                }
-            )
-
-        # Оценка для каждого GT
         for gt_item in abs_gts:
             gt_det = gt_item["det"]
             gt_abs_bbox = gt_item["abs_bbox"]
             gt_area = calculate_area(gt_abs_bbox)
             gt_det["max_pred_inclusion_in_gt"] = 0.0
             gt_det["gt_covered_by_inclusion"] = False
-
             if gt_area > 0 and abs_preds:
                 for pred_item in abs_preds:
                     pred_abs_bbox = pred_item["abs_bbox"]
@@ -143,19 +155,15 @@ def evaluate_by_inclusion(
                     inclusion_in_gt = intersection_area / gt_area if gt_area > 0 else 0
                     if inclusion_in_gt > gt_det["max_pred_inclusion_in_gt"]:
                         gt_det["max_pred_inclusion_in_gt"] = inclusion_in_gt
-
                 if gt_det["max_pred_inclusion_in_gt"] >= gt_covered_threshold:
                     gt_det["gt_covered_by_inclusion"] = True
-            # gt_det.save() # autosave=True в iter_samples должен это делать
 
-        # Оценка для каждого Pred
         for pred_item in abs_preds:
             pred_det = pred_item["det"]
             pred_abs_bbox = pred_item["abs_bbox"]
             pred_area = calculate_area(pred_abs_bbox)
-            pred_det["max_gt_inclusion_in_pred"] = 0.0  # Area(I(GT,P)) / Area(P)
-            pred_det["max_gt_coverage_by_pred"] = 0.0  # Area(I(GT,P)) / Area(GT)
-
+            pred_det["max_gt_inclusion_in_pred"] = 0.0
+            pred_det["max_gt_coverage_by_pred"] = 0.0
             if pred_area > 0 and abs_gts:
                 for gt_item in abs_gts:
                     gt_abs_bbox = gt_item["abs_bbox"]
@@ -163,40 +171,113 @@ def evaluate_by_inclusion(
                     intersection_area = calculate_intersection_area(
                         gt_abs_bbox, pred_abs_bbox
                     )
-
                     inclusion_in_pred = (
                         intersection_area / pred_area if pred_area > 0 else 0
                     )
                     if inclusion_in_pred > pred_det["max_gt_inclusion_in_pred"]:
                         pred_det["max_gt_inclusion_in_pred"] = inclusion_in_pred
-
                     coverage_of_gt = intersection_area / gt_area if gt_area > 0 else 0
                     if coverage_of_gt > pred_det["max_gt_coverage_by_pred"]:
                         pred_det["max_gt_coverage_by_pred"] = coverage_of_gt
-            # pred_det.save() # autosave=True
-
     print(f"Custom inclusion evaluation complete for {dataset.name}.")
+
+
+# --- Функция для вычисления эмбеддингов патчей ---
+def compute_and_save_patch_embeddings(
+    dataset_or_view,
+    patches_field="ground_truth",  # Для каких объектов считать: GT или Predictions
+    model_name="clip-vit-base-patch32-torch",  # Модель для эмбеддингов
+    embeddings_storage_field="patch_embeddings",  # Имя поля для сохранения в Detection
+):
+    """
+    Вычисляет и сохраняет эмбеддинги для патчей (объектов) в датасете.
+    """
+    if not isinstance(dataset_or_view, (fo.Dataset, fo.DatasetView)):
+        print(
+            "Ошибка: Первый аргумент должен быть объектом fo.Dataset или fo.DatasetView."
+        )
+        return
+
+    # Имя поля, куда будут сохранены эмбеддинги для каждого объекта
+    # Добавим префикс от patches_field, чтобы было понятно, чьи это эмбеддинги
+    final_embeddings_field = f"{patches_field}_{embeddings_storage_field}"
+
+    # Проверяем, есть ли вообще поле с детекциями
+    if not dataset_or_view.has_sample_field(patches_field):
+        print(
+            f"Поле '{patches_field}' не найдено в датасете/view. Пропуск вычисления эмбеддингов."
+        )
+        return
+
+    # Создаем view только с сэмплами, где есть детекции в patches_field
+    # и у этих детекций еще нет посчитанных эмбеддингов в target field
+    # view_to_process = dataset_or_view.filter_labels(patches_field, fo.ViewField(final_embeddings_field).exists() == False)
+    # Более простой способ - просто вычислить для всех, compute_embeddings может иметь опцию overwrite
+
+    # Проверим, есть ли вообще объекты в patches_field
+    # Собираем все метки из поля patches_field.detections.label
+    # distinct_labels = dataset_or_view.distinct(f"{patches_field}.detections.label")
+    # if not distinct_labels: # Если список меток пуст, значит объектов нет
+    #     print(f"В датасете/view нет объектов в поле '{patches_field}' для вычисления эмбеддингов. Пропуск.")
+    #     return
+
+    # Проверка на наличие самих detections
+    # Считаем количество сэмплов, у которых есть хотя бы одна детекция в patches_field
+    # Это может быть медленно на больших датасетах, но fo.compute_embeddings справится с пустыми
+    # count_samples_with_patches = dataset_or_view.count(fo.ViewField(f"{patches_field}.detections").length() > 0)
+    # if count_samples_with_patches == 0:
+    #     print(f"В датасете/view нет объектов в поле '{patches_field}' для вычисления эмбеддингов. Пропуск.")
+    #     return
+
+    print(
+        f"Вычисление эмбеддингов для объектов из поля '{patches_field}' датасета '{dataset_or_view.name}'."
+    )
+    print(
+        f"Модель: {model_name}. Результат будет сохранен в поле '{final_embeddings_field}' каждой детекции."
+    )
+
+    try:
+        fo.compute_embeddings(
+            dataset_or_view,
+            model_name,
+            embeddings_field=final_embeddings_field,
+            patches_field=patches_field,
+            # batch_size=10 # Можно настроить для управления памятью/скоростью
+        )
+        print(f"Эмбеддинги успешно вычислены и сохранены.")
+        if isinstance(dataset_or_view, fo.Dataset):  # Если это датасет, а не view
+            dataset_or_view.save()  # Сохраняем изменения в датасете
+    except Exception as e:
+        print(f"Ошибка при вычислении эмбеддингов: {e}")
+        print(
+            "Убедитесь, что модель существует и все зависимости установлены (torch, torchvision, transformers и т.д.)."
+        )
+        print(
+            "Также проверьте, что в `patches_field` действительно есть объекты Detection."
+        )
 
 
 def load_class_dataset_from_csv(
     csv_file,
     predictions_dict,
-    iou_dict={0.7: "IOU_0.7"},  # Это останется для не-SKIP классов
-    launch_app_on_completion=False,  # Новый параметр
-    port=30082,  # Порт для запуска, если нужно
+    iou_dict={0.7: "IOU_0.7"},
+    launch_app_on_completion=False,
+    port=30082,
+    compute_embeddings_for_gt=False,  # Новый параметр
+    embeddings_model="clip-vit-base-patch32-torch",  # Модель для эмбеддингов
 ):
     base_name = os.path.basename(csv_file)
     class_name = os.path.splitext(base_name)[0]
 
     print(f"\n=== Обработка CSV: {csv_file} (класс: {class_name}) ===")
 
-    dataset_name = f"{class_name}"  # Можно добавить префикс/суффикс для ясности
+    dataset_name = f"{class_name}"
     if dataset_name in fo.list_datasets():
         print(f"Dataset {dataset_name} уже существует. Удаление и создание заново.")
         fo.delete_dataset(dataset_name)
 
     dataset = fo.Dataset(dataset_name)
-    dataset.persistent = True  # Важно для сохранения датасета
+    dataset.persistent = True
 
     df = pd.read_csv(csv_file)
     df = df.dropna(subset=["bbox_x_tl", "bbox_y_tl", "bbox_x_br", "bbox_y_br"])
@@ -209,22 +290,30 @@ def load_class_dataset_from_csv(
         "instance_label",
     }
     if not required_cols.issubset(df.columns):
-        raise ValueError(f"CSV {csv_file} должен содержать столбцы: {required_cols}")
+        print(
+            f"Предупреждение: CSV {csv_file} не содержит всех обязательных столбцов: {required_cols}. Пропускаем файл."
+        )
+        return None  # Возвращаем None, если файл не может быть обработан
 
-    # Собираем GT и Preds в структуры, удобные для FiftyOne
-    # {image_path: {"gt": [...], "pred": [...], "size": (w,h), "image_name": ...}}
     processed_data = {}
-
     for _, row in df.iterrows():
         image_path = row["image_path"]
-        if not os.path.exists(image_path):  # Проверка существования файла GT
-            # print(f"Предупреждение: Файл изображения {image_path} не найден. Пропуск.")
+        if not os.path.exists(image_path):
+            # print(f"Предупреждение: Файл изображения {image_path} не найден. Пропуск строки.")
             continue
 
         image_name = row["image_name"]
-        w, h = int(row["image_width"]), int(
-            row["image_height"]
-        )  # Убедимся, что это int
+
+        # Проверка на NaN или некорректные значения для размеров изображения
+        try:
+            w, h = int(row["image_width"]), int(row["image_height"])
+            if w <= 0 or h <= 0:
+                # print(f"Предупреждение: Некорректные размеры изображения (w={w}, h={h}) для {image_name} в {csv_file}. Пропуск строки.")
+                continue
+        except ValueError:
+            # print(f"Предупреждение: Не удалось преобразовать размеры изображения в int для {image_name} в {csv_file}. Пропуск строки.")
+            continue
+
         label = row["instance_label"]
         x1, y1, x2, y2 = (
             row["bbox_x_tl"],
@@ -236,104 +325,80 @@ def load_class_dataset_from_csv(
         if image_path not in processed_data:
             processed_data[image_path] = {
                 "gt_detections": [],
-                "pred_detections": [],  # Заполним позже
+                "pred_detections": [],
                 "size": (w, h),
                 "image_name": image_name,
             }
 
-        # Добавляем GT детекцию
         gt_detection_data = {
             "label": map_gt_class(label),
             "bounding_box": [x1 / w, y1 / h, (x2 - x1) / w, (y2 - y1) / h],
-            "abs_coords": [
-                float(x1),
-                float(y1),
-                float(x2),
-                float(y2),
-            ],  # Сохраняем абсолютные для кастомной метрики
-            "box_width": x2 - x1,
-            "box_height": y2 - y1,
+            "box_width_abs": float(x2 - x1),  # Сохраняем абсолютную ширину/высоту
+            "box_height_abs": float(y2 - y1),
             "cvat_task": CVAT_LINK
             + f'/tasks/{row["task_id"]}/jobs/{int(row["job_id"])}?frame={row["image_id"]}',
         }
         processed_data[image_path]["gt_detections"].append(gt_detection_data)
 
-    # Добавляем предсказания
     for image_path, data in processed_data.items():
         image_name = data["image_name"]
         w, h = data["size"]
 
         if image_name in predictions_dict:
             preds_for_img = predictions_dict[image_name]
-            # model_labels_for_class = OUR_TO_MODEL_CLASSES.get(class_name, {class_name}) # Для фильтрации по основному классу CSV
-
             if isinstance(preds_for_img, list):
                 for pred in preds_for_img:
                     if not all(k in pred for k in ["label", "score", "bbox"]):
                         continue
-
                     pred_label_mapped = map_classes(pred["label"])
-                    # Если мы хотим строгую привязку к классу CSV:
-                    # if pred_label_mapped not in model_labels_for_class and class_name not in SKIP: # Для SKIP классов можем хотеть все предсказания
-                    #     continue
-
-                    # Фильтрация предсказаний по размерам (применяется к классу ПРЕДСКАЗАНИЯ)
-                    group = get_group_for_label(
-                        pred_label_mapped
-                    )  # Используем смапленный лейбл предсказания
+                    group = get_group_for_label(pred_label_mapped)
                     if group in SIZE_REQUIREMENTS:
                         min_width, min_height = SIZE_REQUIREMENTS[group]
-                        x1p, y1p, x2p, y2p = pred["bbox"]
-                        width_p = x2p - x1p
-                        height_p = y2p - y1p
-                        if width_p < min_width or height_p < min_height:
+                        x1p, y1p, x2p, y2p_abs = pred[
+                            "bbox"
+                        ]  # Предполагаем абсолютные из JSON
+                        width_p_abs = x2p_abs - x1p
+                        height_p_abs = y2p_abs - y1p
+                        if width_p_abs < min_width or height_p_abs < min_height:
                             continue
 
-                    x1p, y1p, x2p, y2p = pred["bbox"]
+                    x1p_abs, y1p_abs, x2p_abs, y2p_abs = pred["bbox"]
                     pred_detection_data = {
                         "label": pred_label_mapped,
                         "bounding_box": [
-                            x1p / w,
-                            y1p / h,
-                            (x2p - x1p) / w,
-                            (y2p - y1p) / h,
+                            x1p_abs / w,
+                            y1p_abs / h,
+                            (x2p_abs - x1p_abs) / w,
+                            (y2p_abs - y1p_abs) / h,
                         ],
-                        "abs_coords": [
-                            float(x1p),
-                            float(y1p),
-                            float(x2p),
-                            float(y2p),
-                        ],  # Сохраняем абсолютные
                         "confidence": pred["score"],
-                        "box_width": x2p - x1p,
-                        "box_height": y2p - y1p,
+                        "box_width_abs": float(x2p_abs - x1p_abs),
+                        "box_height_abs": float(y2p_abs - y1p_abs),
                     }
                     data["pred_detections"].append(pred_detection_data)
 
-    # Создаем сэмплы FiftyOne
     samples_to_add = []
     for image_path, data in processed_data.items():
         gt_objects = [fo.Detection(**d) for d in data["gt_detections"]]
         pred_objects = [fo.Detection(**d) for d in data["pred_detections"]]
-
         sample = fo.Sample(
             filepath=image_path,
             ground_truth=fo.Detections(detections=gt_objects),
             predictions=fo.Detections(detections=pred_objects),
         )
-        # Добавляем metadata, если его нет (FiftyOne обычно делает это автоматически при добавлении)
-        # sample.compute_metadata() # Это нужно если width/height не были в CSV и их надо извлечь из файла
+        # FiftyOne автоматически вычислит metadata (width, height из файла), если их нет.
+        # Но так как мы их берем из CSV, они должны быть корректными.
+        # Если есть сомнения, можно добавить sample.compute_metadata(overwrite=False)
         samples_to_add.append(sample)
 
     if samples_to_add:
         dataset.add_samples(samples_to_add)
         print(f"Добавлено {len(samples_to_add)} сэмплов в датасет {dataset_name}.")
     else:
-        print(f"Нет данных для добавления в датасет {dataset_name}.")
-        # fo.delete_dataset(dataset_name) # Можно удалить пустой датасет
-        return None  # или dataset, если хотим сохранить пустой
+        print(f"Нет валидных данных для добавления в датасет {dataset_name}.")
+        return dataset  # Возвращаем пустой датасет, если он был создан
 
-    # --- Оценка ---
+    # --- Оценка или кастомная логика ---
     if class_name in SKIP:
         print(
             f"Класс {class_name} находится в SKIP. Запуск кастомной оценки по вхождению."
@@ -345,49 +410,71 @@ def load_class_dataset_from_csv(
         print(f"Класс {class_name} НЕ в SKIP. Запуск стандартной оценки IoU.")
         for iou_thr, iou_tag in iou_dict.items():
             print(f"Оценка для IoU = {iou_thr} (ключ: {iou_tag})")
-            try:
-                dataset.evaluate_detections(
-                    "predictions",
-                    gt_field="ground_truth",
-                    eval_key=iou_tag,
-                    method="coco",  # стандартный метод
-                    iou=iou_thr,
-                    compute_mAP=False,  # Пока mAP не считаем для отдельных классов
-                    progress=True,
-                )
-            except Exception as e:
-                print(
-                    f"Ошибка при оценке для IoU {iou_thr} для класса {class_name}: {e}"
-                )
-                print(
-                    "Возможно, нет GT или предсказаний для этого класса, или они не пересекаются."
-                )
+            # Проверим, есть ли вообще GT детекции, чтобы избежать ошибки
+            if dataset.count(f"ground_truth.detections") > 0:
+                try:
+                    dataset.evaluate_detections(
+                        "predictions",
+                        gt_field="ground_truth",
+                        eval_key=iou_tag,
+                        method="coco",
+                        iou=iou_thr,
+                        compute_mAP=False,
+                        progress=True,
+                    )
+                except Exception as e:
+                    print(
+                        f"Ошибка при оценке для IoU {iou_thr} для класса {class_name}: {e}"
+                    )
+            else:
+                print(f"Пропуск оценки IoU для {class_name}: нет GT детекций.")
+
+    # --- Вычисление эмбеддингов ---
+    if compute_embeddings_for_gt:
+        print(f"Вычисление эмбеддингов для GT объектов датасета {dataset_name}...")
+        compute_and_save_patch_embeddings(
+            dataset,
+            patches_field="ground_truth",  # Считаем для GT
+            model_name=embeddings_model,
+            embeddings_storage_field="clip_embeddings",  # Пример имени поля
+        )
+        # Можно также посчитать для predictions, если нужно
+        # compute_and_save_patch_embeddings(
+        #     dataset,
+        #     patches_field="predictions",
+        #     model_name=embeddings_model,
+        #     embeddings_storage_field="clip_embeddings"
+        # )
 
     print(f"\nДатасет {dataset_name} обработан и сохранен.")
-
     session = None
     if launch_app_on_completion:
         print(f"Запуск FiftyOne App для датасета {dataset_name} на порту {port}...")
-        session = fo.launch_app(
-            dataset, address="0.0.0.0", port=port, auto=False
-        )  # auto=False чтобы не открывать сразу
-        print(f"FiftyOne App доступен по адресу: http://<ваш_ip>:{port}")
+        try:
+            session = fo.launch_app(dataset, address="0.0.0.0", port=port, auto=False)
+            print(
+                f"FiftyOne App должен быть доступен по адресу: http://<ваш_ip>:{port} (или localhost:{port})"
+            )
+        except Exception as e:
+            print(f"Не удалось запустить FiftyOne App: {e}")
+            print(
+                "Возможно, порт уже занят или есть другая проблема с запуском сервера."
+            )
 
-    return dataset  # Возвращаем датасет, вдруг он понадобится в main
+    return dataset
 
 
 def main():
-    LAUNCH_APP_INTERACTIVELY = (
-        False  # True, если хотите открывать браузер для каждого датасета
+    LAUNCH_APP_FOR_EACH = False  # Открывать браузер для каждого датасета?
+    COMPUTE_GT_EMBEDDINGS = True  # Вычислять эмбеддинги для GT патчей?
+    EMBEDDINGS_MODEL_NAME = "clip-vit-base-patch32-torch"  # Модель для эмбеддингов
+
+    # Убедитесь, что модель существует и зависимости установлены.
+    # fo.zoo.models.list_downloadable_models(tags="embedding") для списка доступных.
+
+    start_port = (
+        30082  # Начальный порт для FiftyOne App, если LAUNCH_APP_FOR_EACH = True
     )
-    # Или можно сделать более сложную логику:
-    # LAUNCH_APP_FOR_LAST_ONLY = True
-    # LAUNCH_APP_MANUALLY_LATER = True (по умолчанию, ничего не запускаем из скрипта)
-
-    # Установим глобальный порт для сессий, если нужно, чтобы они не конфликтовали
-    # fo.config.default_app_port = 30082 # Если хотите фиксированный порт по умолчанию
-
-    current_port = 30082  # Начальный порт
 
     try:
         with open(PATH_TO_PREDICTIONS, "r") as f:
@@ -404,46 +491,68 @@ def main():
         print(f"CSV файлы не найдены в {PATH_TO_SPLIT}")
         return
 
-    loaded_datasets_names = []
+    loaded_datasets_info = []  # Будем хранить имя и был ли запущен app
 
     for i, csv_file in enumerate(csv_files):
-        # Логика для порта: или инкрементировать, или использовать один и тот же,
-        # но тогда предыдущая сессия закроется при запуске новой на том же порту.
-        # Если LAUNCH_APP_INTERACTIVELY = False, порт не так важен здесь.
-        port_for_this_dataset = current_port  # + i # если хотим разные порты
+        port_for_this_dataset = start_port + i if LAUNCH_APP_FOR_EACH else start_port
 
         dataset = load_class_dataset_from_csv(
             csv_file=csv_file,
             predictions_dict=predictions_dict,
-            iou_dict=IOU_DICT,  # Для не-SKIP классов
-            launch_app_on_completion=LAUNCH_APP_INTERACTIVELY,
+            iou_dict=IOU_DICT,
+            launch_app_on_completion=LAUNCH_APP_FOR_EACH,
             port=port_for_this_dataset,
+            compute_embeddings_for_gt=COMPUTE_GT_EMBEDDINGS,
+            embeddings_model=EMBEDDINGS_MODEL_NAME,
         )
         if dataset:
-            loaded_datasets_names.append(dataset.name)
-            if LAUNCH_APP_INTERACTIVELY:
-                print(
-                    f"Сессия для {dataset.name} запущена. Нажмите Ctrl+C в консоли, где запущен Python, чтобы остановить ЕЁ и перейти к следующему, ИЛИ закройте вкладку браузера."
-                )
-                # session.wait() # Это заблокирует выполнение до закрытия окна FiftyOne
-                input(
-                    "Нажмите Enter для обработки следующего файла (если сессия не блокирует)..."
-                )  # Дает время посмотреть
+            loaded_datasets_info.append(
+                {
+                    "name": dataset.name,
+                    "app_launched": LAUNCH_APP_FOR_EACH,  # Был ли сделан вызов launch_app
+                    "port": port_for_this_dataset if LAUNCH_APP_FOR_EACH else None,
+                }
+            )
+            if LAUNCH_APP_FOR_EACH and dataset:  # Если запускали приложение
+                print(f"Обработка датасета {dataset.name} завершена.")
+                # input("Нажмите Enter для обработки следующего файла (если сессия не блокирует)...")
+                print("-" * 30)
 
     print("\n=== Обработка всех CSV завершена ===")
-    if loaded_datasets_names:
-        print("Следующие датасеты были созданы или обновлены в FiftyOne:")
-        for name in loaded_datasets_names:
-            print(f"- {name}")
+    if loaded_datasets_info:
+        print("Следующие датасеты были созданы/обновлены в FiftyOne:")
+        for info in loaded_datasets_info:
+            msg = f"- {info['name']}"
+            if COMPUTE_GT_EMBEDDINGS:
+                msg += " (с эмбеддингами для GT)"
+            if info["app_launched"]:
+                msg += f" (приложение запущено на порту {info['port']})"
+            print(msg)
+
         print(
-            "\nВы можете запустить FiftyOne App вручную, чтобы их просмотреть, например:"
+            "\nЧтобы просмотреть датасет (если приложение не было запущено автоматически):"
         )
         print("import fiftyone as fo")
+        if loaded_datasets_info:  # Проверка, что список не пуст
+            example_name = loaded_datasets_info[0]["name"]
+            print(f"dataset = fo.load_dataset('{example_name}')")
+            print(
+                f"session = fo.launch_app(dataset, port={start_port}) # Укажите нужный порт"
+            )
+            print("session.wait()")
+        print("\nВ FiftyOne App:")
         print(
-            f"dataset = fo.load_dataset('{loaded_datasets_names[0]}') # Загрузить один из датасетов"
+            "  - Для классов из SKIP: смотрите кастомные поля в детекциях (например, 'max_pred_inclusion_in_gt')."
         )
-        print("session = fo.launch_app(dataset)")
-        print("session.wait()")
+        print(
+            "  - Если эмбеддинги были посчитаны (для 'ground_truth_patch_embeddings' или аналогичного поля):"
+        )
+        print("    - Откройте панель 'Embeddings'.")
+        print("    - Выберите в 'Label field' -> 'ground_truth.detections'.")
+        print(
+            "    - В 'Field with embeddings' выберите 'ground_truth_clip_embeddings' (или как вы назвали поле)."
+        )
+        print("    - Нажмите 'Compute visualization' (например, UMAP).")
     else:
         print("Не было создано ни одного датасета.")
 
