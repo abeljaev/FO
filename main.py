@@ -19,7 +19,6 @@ from config import (
 )
 
 IOU_DICT = {0.4: "eval_IOU_04", 0.7: "eval_IOU_07"}
-CVAT_LINK = "http://stal-dtl-gpu10:8080"
 
 SKIP = {"safety", "no_safety", "chin_strap", "chin_strap_off", "glasses", "glasses_off"}
 INCLUSION_THRESHOLD_GT_COVERED = 0.8
