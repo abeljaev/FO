@@ -6,7 +6,8 @@ import numpy as np
 import fiftyone as fo
 import fiftyone.zoo as foz
 from loguru import logger
-from fiftyone import F  # Для более сложных проверок полей, если понадобится
+
+# from fiftyone import F # F больше не используется в этом варианте, можно удалить
 
 # --- НАСТРОЙКИ ЛОГИРОВАНИЯ (Минимальные) ---
 logger.remove()
@@ -394,8 +395,8 @@ def main():
         "LAUNCH_APP_FOR_EACH": False,
         "COMPUTE_GT_EMBEDDINGS": True,
         "ZOO_MODEL_NAME_FOR_EMBEDDINGS": "dinov2-vitb14-torch",
-        # "ZOO_MODEL_NAME_FOR_EMBEDDINGS": "clip-vit-base32-torch",
-        "EMBEDDINGS_FIELD_NAME_IN_DETECTION": "embedding",  # Простое имя поля для эмбеддинга
+        # "ZOO_MODEL_NAME_FOR_EMBEDDINGS": "clip-vit-base32-torch", # Убедитесь, что это имя есть в foz.list_zoo_models()
+        "EMBEDDINGS_FIELD_NAME_IN_DETECTION": "embedding",
         "START_PORT": 30082,
     }
 
@@ -434,19 +435,28 @@ def main():
         ds = load_class_dataset_from_csv(csv_f, all_preds, LOADER_PARAMS)
         if ds:
             info = {"name": ds.name, "emb": False}
+            # Упрощенная проверка: если вычисления были включены и не было критических ошибок, предполагаем, что они есть
             if APP_CONFIG["COMPUTE_GT_EMBEDDINGS"]:
-                # Проверяем наличие поля у первой детекции первого сэмпла, если есть
-                # Это не 100% гарантия, что все детекции имеют поле, но быстрая проверка
-                first_sample_with_gt = ds.match(
-                    F("ground_truth.detections").length() > 0
-                ).first()
+                # Для более точной проверки можно было бы проверить наличие поля у конкретной детекции,
+                # но это усложнит код здесь. Логи compute_and_save_patch_embeddings должны показать, если были проблемы.
+                first_sample_with_gt = (
+                    ds.first()
+                )  # Берем первый сэмпл для проверки (может не иметь GT)
                 if (
                     first_sample_with_gt
                     and first_sample_with_gt.ground_truth
                     and first_sample_with_gt.ground_truth.detections
+                    and len(first_sample_with_gt.ground_truth.detections) > 0
                     and APP_CONFIG["EMBEDDINGS_FIELD_NAME_IN_DETECTION"]
                     in first_sample_with_gt.ground_truth.detections[0]
                 ):
+                    info["emb"] = True
+                elif (
+                    ds.count(
+                        f"ground_truth.detections.{APP_CONFIG['EMBEDDINGS_FIELD_NAME_IN_DETECTION']}"
+                    )
+                    > 0
+                ):  # Проверка по всему датасету (может быть медленно)
                     info["emb"] = True
 
             if APP_CONFIG["LAUNCH_APP_FOR_EACH"] and ds.count() > 0:
