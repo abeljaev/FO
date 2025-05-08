@@ -2,10 +2,16 @@ import os
 import glob
 import json
 import pandas as pd
-import numpy as np  # Используется неявно fiftyone или sklearn
+import numpy as np
 import fiftyone as fo
-import fiftyone.zoo as foz  # Используется неявно для compute_embeddings
+
+# import fiftyone.zoo as foz # foz может больше не понадобиться, если не используем list_zoo_models
 from loguru import logger
+from PIL import Image
+import torch
+
+# from torchvision import transforms as T # T может не понадобиться, если AutoImageProcessor справляется
+from transformers import AutoImageProcessor, AutoModel
 
 # --- НАСТРОЙКИ ЛОГИРОВАНИЯ ---
 logger.remove()
@@ -14,11 +20,9 @@ logger.add(
     level="INFO",
     format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
 )
-# logger.add("processing_{time}.log", level="DEBUG", rotation="10 MB") # Опционально: запись в файл с ротацией
+# logger.add("processing_{time}.log", level="DEBUG", rotation="10 MB")
 
 # --- ИМПОРТ КОНФИГУРАЦИИ ---
-# Предполагается, что эти переменные определены в config.py
-# Пример содержимого config.py смотрите в README
 try:
     from config import (
         PATH_TO_SPLIT,
@@ -28,17 +32,16 @@ try:
         MODEL_MAPPING,
         CLASSES_GROUPS,
         CVAT_LINK,
-        LOCAL_MODELS_DIR,  # Путь к директории, где хранятся скачанные модели
+        LOCAL_MODELS_DIR,
     )
 except ImportError:
     logger.critical(
-        "Не удалось импортировать конфигурацию из config.py. Убедитесь, что файл существует и содержит все необходимые переменные."
+        "Не удалось импортировать конфигурацию из config.py. Убедитесь, что файл существует и содержит все необходимые переменные, включая LOCAL_MODELS_DIR."
     )
     exit()
 
-# --- ГЛОБАЛЬНЫЕ КОНСТАНТЫ ИЗ СКРИПТА (можно вынести в config.py) ---
+# --- ГЛОБАЛЬНЫЕ КОНСТАНТЫ ИЗ СКРИПТА ---
 IOU_DICT = {0.4: "eval_IOU_04", 0.7: "eval_IOU_07"}
-# Классы, для которых используется кастомная оценка по вхождению вместо IoU
 SKIP_CLASSES_FOR_IOU_EVAL = {
     "safety",
     "no_safety",
@@ -47,7 +50,7 @@ SKIP_CLASSES_FOR_IOU_EVAL = {
     "glasses",
     "glasses_off",
 }
-INCLUSION_THRESHOLD_GT_COVERED = 0.8  # Порог для кастомной метрики вхождения
+INCLUSION_THRESHOLD_GT_COVERED = 0.8
 
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
@@ -59,28 +62,23 @@ def get_group_for_label(label: str) -> str:
 
 
 def map_prediction_label_to_canonical(pred_label_from_model: str) -> str:
-    """Маппинг метки предсказания модели к канонической метке для сравнения."""
-    for target_label, source_model_labels in MODEL_MAPPING.items():
-        if pred_label_from_model in source_model_labels:
-            return target_label
+    for target, sources in MODEL_MAPPING.items():
+        if pred_label_from_model in sources:
+            return target
     return pred_label_from_model
 
 
 def map_our_gt_label_to_model_label_set(our_gt_label: str) -> set:
-    """
-    Преобразование нашей GT метки (из CSV) в НАБОР соответствующих меток модели.
-    Это используется для фильтрации GT и предсказаний для конкретного датасета класса.
-    """
     return OUR_TO_MODEL_CLASSES.get(our_gt_label, {our_gt_label})
 
 
 # --- ФУНКЦИИ ДЛЯ РАСЧЕТА ГЕОМЕТРИИ ---
 def get_abs_bbox_from_normalized(norm_bbox, img_width, img_height):
-    x, y, w, h = norm_bbox
+    x, y, w, h_norm = norm_bbox
     x1 = x * img_width
     y1 = y * img_height
     x2 = (x + w) * img_width
-    y2 = (y + h) * img_height
+    y2 = (y + h_norm) * img_height
     return [x1, y1, x2, y2]
 
 
@@ -106,7 +104,6 @@ def evaluate_by_inclusion(
 ):
     logger.info(f"Запуск кастомной оценки по вхождению для датасета: {dataset.name}")
     view = dataset.view()
-
     for sample in view.iter_samples(autosave=True, progress=True):
         if (
             sample.metadata is None
@@ -117,84 +114,168 @@ def evaluate_by_inclusion(
                 sample.compute_metadata(overwrite=False)
                 if sample.metadata is None or sample.metadata.width is None:
                     logger.error(
-                        f"Не удалось вычислить метаданные для {sample.filepath}. Пропуск оценки вхождения для этого сэмпла."
+                        f"Не удалось вычислить метаданные для {sample.filepath}. Пропуск."
                     )
                     continue
             except Exception as e:
                 logger.error(
-                    f"Ошибка вычисления метаданных для {sample.filepath}: {e}. Пропуск оценки вхождения."
+                    f"Ошибка вычисления метаданных для {sample.filepath}: {e}. Пропуск."
                 )
                 continue
-
-        img_width, img_height = sample.metadata.width, sample.metadata.height
-        gt_detections = (
+        img_w, img_h = sample.metadata.width, sample.metadata.height
+        gts = (
             sample[gt_field].detections
             if sample[gt_field] and sample[gt_field].detections
             else []
         )
-        pred_detections = (
+        preds = (
             sample[pred_field].detections
             if sample[pred_field] and sample[pred_field].detections
             else []
         )
-
         abs_gts = [
-            {
-                "det": gt,
-                "abs_bbox": get_abs_bbox_from_normalized(
-                    gt.bounding_box, img_width, img_height
-                ),
-            }
-            for gt in gt_detections
+            {"d": gt, "bb": get_abs_bbox_from_normalized(gt.bounding_box, img_w, img_h)}
+            for gt in gts
         ]
         abs_preds = [
-            {
-                "det": p,
-                "abs_bbox": get_abs_bbox_from_normalized(
-                    p.bounding_box, img_width, img_height
-                ),
-            }
-            for p in pred_detections
+            {"d": p, "bb": get_abs_bbox_from_normalized(p.bounding_box, img_w, img_h)}
+            for p in preds
         ]
 
         for gt_item in abs_gts:
-            gt_det, gt_abs_bbox = gt_item["det"], gt_item["abs_bbox"]
-            gt_area = calculate_area(gt_abs_bbox)
-            gt_det["max_pred_inclusion_in_gt"] = 0.0
-            gt_det["gt_covered_by_inclusion"] = False
+            gt_d, gt_bb = gt_item["d"], gt_item["bb"]
+            gt_area = calculate_area(gt_bb)
+            gt_d["max_pred_inclusion_in_gt"] = 0.0
+            gt_d["gt_covered_by_inclusion"] = False
             if gt_area > 0 and abs_preds:
                 for pred_item in abs_preds:
-                    intersection = calculate_intersection_area(
-                        gt_abs_bbox, pred_item["abs_bbox"]
-                    )
-                    inclusion = intersection / gt_area
-                    if inclusion > gt_det["max_pred_inclusion_in_gt"]:
-                        gt_det["max_pred_inclusion_in_gt"] = inclusion
-                if gt_det["max_pred_inclusion_in_gt"] >= gt_covered_threshold:
-                    gt_det["gt_covered_by_inclusion"] = True
+                    incl = calculate_intersection_area(gt_bb, pred_item["bb"]) / gt_area
+                    if incl > gt_d["max_pred_inclusion_in_gt"]:
+                        gt_d["max_pred_inclusion_in_gt"] = incl
+                if gt_d["max_pred_inclusion_in_gt"] >= gt_covered_threshold:
+                    gt_d["gt_covered_by_inclusion"] = True
 
         for pred_item in abs_preds:
-            pred_det, pred_abs_bbox = pred_item["det"], pred_item["abs_bbox"]
-            pred_area = calculate_area(pred_abs_bbox)
-            pred_det["max_gt_inclusion_in_pred"] = 0.0  # Area(I(GT,P)) / Area(P)
-            pred_det["max_gt_coverage_by_pred"] = (
-                0.0  # Area(I(GT,P)) / Area(GT) - насколько этот пред покрывает какой-либо GT
-            )
+            pred_d, pred_bb = pred_item["d"], pred_item["bb"]
+            pred_area = calculate_area(pred_bb)
+            pred_d["max_gt_inclusion_in_pred"] = 0.0
+            pred_d["max_gt_coverage_by_pred"] = 0.0
             if pred_area > 0 and abs_gts:
                 for gt_item in abs_gts:
-                    intersection = calculate_intersection_area(
-                        gt_item["abs_bbox"], pred_abs_bbox
-                    )
-                    inclusion_in_p = intersection / pred_area
-                    if inclusion_in_p > pred_det["max_gt_inclusion_in_pred"]:
-                        pred_det["max_gt_inclusion_in_pred"] = inclusion_in_p
-
-                    gt_area_for_coverage = calculate_area(gt_item["abs_bbox"])
-                    if gt_area_for_coverage > 0:
-                        coverage_of_gt = intersection / gt_area_for_coverage
-                        if coverage_of_gt > pred_det["max_gt_coverage_by_pred"]:
-                            pred_det["max_gt_coverage_by_pred"] = coverage_of_gt
+                    inter = calculate_intersection_area(gt_item["bb"], pred_bb)
+                    if (
+                        pred_area > 0
+                        and inter / pred_area > pred_d["max_gt_inclusion_in_pred"]
+                    ):
+                        pred_d["max_gt_inclusion_in_pred"] = inter / pred_area
+                    gt_area_curr = calculate_area(gt_item["bb"])
+                    if (
+                        gt_area_curr > 0
+                        and inter / gt_area_curr > pred_d["max_gt_coverage_by_pred"]
+                    ):
+                        pred_d["max_gt_coverage_by_pred"] = inter / gt_area_curr
     logger.info(f"Кастомная оценка по вхождению для {dataset.name} завершена.")
+
+
+# --- КЛАСС-ОБЕРТКА ДЛЯ ЛОКАЛЬНОЙ МОДЕЛИ HUGGING FACE ---
+class HuggingFaceEmbedder(fo.core.models.Model):
+    def __init__(self, model_path, device=None):
+        self.model_path = model_path
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+        logger.info(f"Загрузка модели Hugging Face из: {self.model_path}")
+        self.processor = AutoImageProcessor.from_pretrained(
+            self.model_path, trust_remote_code=True
+        )
+        self.model = AutoModel.from_pretrained(
+            self.model_path, trust_remote_code=True
+        ).to(self.device)
+        self.model.eval()
+        logger.info(f"Модель загружена на устройство: {self.device}")
+        self._embedding_dim = getattr(self.model.config, "hidden_size", 768)
+
+    @property
+    def has_detector(self):
+        return False
+
+    @property
+    def has_embedder(self):
+        return True
+
+    @property
+    def media_type(self):
+        return "image"
+
+    def get_embeddings(self, frames_or_images):
+        embeddings = []
+        with torch.no_grad():
+            for img_or_path in frames_or_images:
+                try:
+                    if isinstance(img_or_path, str):
+                        img = Image.open(img_or_path).convert("RGB")
+                    elif isinstance(img_or_path, np.ndarray):
+                        img = Image.fromarray(img_or_path).convert("RGB")
+                    else:
+                        raise TypeError(
+                            f"Неподдерживаемый тип входных данных: {type(img_or_path)}"
+                        )
+
+                    inputs = self.processor(images=img, return_tensors="pt").to(
+                        self.device
+                    )
+                    outputs = self.model(**inputs)
+
+                    if hasattr(outputs, "last_hidden_state"):
+                        emb = (
+                            outputs.last_hidden_state[:, 0, :].cpu().numpy().squeeze()
+                        )  # CLS token
+                    elif hasattr(outputs, "pooler_output"):
+                        emb = outputs.pooler_output.cpu().numpy().squeeze()
+                    else:
+                        logger.warning(
+                            f"Не удалось стандартно извлечь эмбеддинг для {self.model_path}. Проверьте структуру выхода модели."
+                        )
+                        # Попытка взять первый элемент, если это тензор или список/кортеж тензоров
+                        output_data = (
+                            outputs[0]
+                            if isinstance(outputs, (list, tuple))
+                            else outputs
+                        )
+                        if (
+                            isinstance(output_data, torch.Tensor)
+                            and output_data.ndim >= 2
+                        ):
+                            # Предполагаем [batch, seq_len, hidden_dim] и берем CLS или [batch, hidden_dim]
+                            emb = (
+                                output_data[:, 0, :].cpu().numpy().squeeze()
+                                if output_data.ndim == 3
+                                else output_data.cpu().numpy().squeeze()
+                            )
+                        else:
+                            emb = np.zeros(self._embedding_dim, dtype=np.float32)
+
+                except Exception as e:
+                    logger.error(
+                        f"Ошибка обработки изображения/получения эмбеддинга для '{str(img_or_path)[:50]}...': {e}"
+                    )
+                    emb = np.zeros(
+                        self._embedding_dim, dtype=np.float32
+                    )  # Заглушка в случае ошибки
+
+                if emb.ndim == 0 or emb.shape[0] != self._embedding_dim:
+                    logger.warning(
+                        f"Получен эмбеддинг неожиданной формы {emb.shape if hasattr(emb, 'shape') else type(emb)} для '{str(img_or_path)[:50]}...'. Используется нулевой вектор."
+                    )
+                    emb = np.zeros(self._embedding_dim, dtype=np.float32)
+
+                embeddings.append(emb)
+        return np.array(embeddings)
+
+    def embed_all(self, frames_or_images):  # FiftyOne <=0.21.x
+        return self.get_embeddings(frames_or_images)
+
+    def embed(self, frame_or_image):  # FiftyOne >=0.22.x
+        return self.get_embeddings([frame_or_image])[0]
 
 
 # --- ВЫЧИСЛЕНИЕ ЭМБЕДДИНГОВ ПАТЧЕЙ ---
@@ -202,7 +283,7 @@ def compute_and_save_patch_embeddings(
     dataset_or_view,
     model_path,
     patches_field="ground_truth",
-    embeddings_storage_field="clip_embeddings",
+    embeddings_storage_field="embeddings",  # Будет передан из APP_CONFIG
 ):
     final_embeddings_field = f"{patches_field}_{embeddings_storage_field}"
     if not dataset_or_view.has_sample_field(patches_field):
@@ -217,9 +298,9 @@ def compute_and_save_patch_embeddings(
     logger.info(
         f"Путь к модели: {model_path}. Результат в поле: '{final_embeddings_field}'."
     )
+    logger.info(f"Используется кастомная обертка HuggingFaceEmbedder.")
 
     try:
-        # Проверка наличия объектов перед вызовом compute_embeddings
         detections_exist = any(
             sample[patches_field] and sample[patches_field].detections
             for sample in dataset_or_view.select_fields(f"{patches_field}.detections")
@@ -230,21 +311,25 @@ def compute_and_save_patch_embeddings(
             )
             return
 
-        fo.compute_embeddings(
-            dataset_or_view,
-            model_path,
+        model_instance = HuggingFaceEmbedder(model_path=model_path)
+
+        dataset_or_view.compute_embeddings(
+            model_instance,
             embeddings_field=final_embeddings_field,
             patches_field=patches_field,
+            batch_size=16,  # Можно настроить
         )
+
         logger.info(f"Эмбеддинги успешно вычислены для {dataset_or_view.name}.")
         if isinstance(dataset_or_view, fo.Dataset):
             dataset_or_view.save()
     except Exception as e:
-        logger.error(
-            f"Ошибка при вычислении эмбеддингов для {dataset_or_view.name} с моделью {model_path}: {e}"
+        logger.exception(
+            f"Ошибка при вычислении эмбеддингов для {dataset_or_view.name} с моделью {model_path}"
         )
         logger.error(
-            "Убедитесь, что путь к модели корректен и содержит все необходимые файлы, а также установлены зависимости (torch, transformers)."
+            "Убедитесь, что путь к модели ('{model_path}') корректен и содержит все необходимые файлы. "
+            "Проверьте зависимости (torch, transformers, PIL)."
         )
 
 
@@ -254,158 +339,125 @@ def load_class_dataset_from_csv(csv_file, all_predictions_dict, config_params):
     logger.info(
         f"=== Обработка CSV: {csv_file} (Наш класс: {our_class_name_from_csv}) ==="
     )
-
     dataset_name = our_class_name_from_csv
     if dataset_name in fo.list_datasets():
-        logger.info(
-            f"Датасет {dataset_name} уже существует. Удаление и создание заново."
-        )
+        logger.info(f"Датасет {dataset_name} уже существует. Удаление.")
         fo.delete_dataset(dataset_name)
     dataset = fo.Dataset(dataset_name, persistent=True)
 
     try:
         df = pd.read_csv(csv_file)
     except Exception as e:
-        logger.error(f"Не удалось прочитать CSV файл {csv_file}: {e}")
+        logger.error(f"Не удалось прочитать CSV {csv_file}: {e}")
         return None
     df = df.dropna(subset=["bbox_x_tl", "bbox_y_tl", "bbox_x_br", "bbox_y_br"])
-
-    required_cols = {
+    req_cols = {
         "image_path",
         "image_name",
         "image_width",
         "image_height",
         "instance_label",
+        "task_id",
+        "job_id",
+        "image_id",
     }
-    if not required_cols.issubset(df.columns):
+    if not req_cols.issubset(df.columns):
+        missing_cols = req_cols - set(df.columns)
         logger.error(
-            f"CSV {csv_file} должен содержать столбцы: {required_cols}. Пропуск файла."
+            f"CSV {csv_file} должен содержать {req_cols}. Отсутствуют: {missing_cols}. Пропуск."
         )
         return None
 
-    # Метки модели, соответствующие текущему нашему классу из CSV
-    target_model_labels_for_csv = map_our_gt_label_to_model_label_set(
-        our_class_name_from_csv
-    )
-    if not target_model_labels_for_csv:
-        logger.warning(
-            f"Для нашего класса '{our_class_name_from_csv}' нет соответствий в классах модели (OUR_TO_MODEL_CLASSES)."
-        )
-    # Метка для отображения GT в датасете (обычно первая из target_model_labels_for_csv)
-    display_gt_label_for_dataset = (
-        list(target_model_labels_for_csv)[0]
-        if target_model_labels_for_csv
-        else our_class_name_from_csv
+    target_model_labels = map_our_gt_label_to_model_label_set(our_class_name_from_csv)
+    display_gt_label = (
+        list(target_model_labels)[0] if target_model_labels else our_class_name_from_csv
     )
 
-    processed_image_data = (
-        {}
-    )  # {image_path: {"gt": [], "pred": [], "size": (), "name": ""}}
-
-    for _, row in df.iterrows():
-        image_path, image_name = row["image_path"], row["image_name"]
-        gt_label_our = row["instance_label"]
-
-        if gt_label_our != our_class_name_from_csv:  # Только GT текущего класса из CSV
+    img_data = {}
+    for _, r in df.iterrows():
+        img_p, img_n, gt_l = r["image_path"], r["image_name"], r["instance_label"]
+        if gt_l != our_class_name_from_csv:
             continue
-        if not os.path.exists(image_path):
-            logger.warning(
-                f"Файл изображения {image_path} из {csv_file} не найден. Пропуск строки."
-            )
+        if not os.path.exists(img_p):
+            logger.warning(f"Файл {img_p} из {csv_file} не найден. Пропуск строки.")
             continue
         try:
-            w, h = int(row["image_width"]), int(row["image_height"])
+            w, h = int(r["image_width"]), int(r["image_height"])
             if w <= 0 or h <= 0:
                 raise ValueError("Incorrect image dimensions")
-        except ValueError:
+        except (ValueError, TypeError):
             logger.warning(
-                f"Некорректные размеры изображения для {image_name} в {csv_file}. Пропуск строки."
+                f"Размеры для {img_n} в {csv_file} некорректны: w='{r['image_width']}', h='{r['image_height']}'. Пропуск."
             )
             continue
 
-        if image_path not in processed_image_data:
-            processed_image_data[image_path] = {
-                "gt_detections": [],
-                "pred_detections": [],
-                "size": (w, h),
-                "image_name": image_name,
+        if img_p not in img_data:
+            img_data[img_p] = {"gts": [], "preds": [], "s": (w, h), "n": img_n}
+        x1, y1, x2, y2 = r["bbox_x_tl"], r["bbox_y_tl"], r["bbox_x_br"], r["bbox_y_br"]
+        img_data[img_p]["gts"].append(
+            {
+                "label": display_gt_label,
+                "bounding_box": [x1 / w, y1 / h, (x2 - x1) / w, (y2 - y1) / h],
+                "box_width_abs": float(x2 - x1),
+                "box_height_abs": float(y2 - y1),
+                "cvat_task": config_params["CVAT_LINK"]
+                + f'/tasks/{r["task_id"]}/jobs/{int(r["job_id"])}?frame={r["image_id"]}',
             }
-
-        x1, y1, x2, y2 = (
-            row["bbox_x_tl"],
-            row["bbox_y_tl"],
-            row["bbox_x_br"],
-            row["bbox_y_br"],
         )
-        gt_data = {
-            "label": display_gt_label_for_dataset,
-            "bounding_box": [x1 / w, y1 / h, (x2 - x1) / w, (y2 - y1) / h],
-            "box_width_abs": float(x2 - x1),
-            "box_height_abs": float(y2 - y1),
-            "cvat_task": config_params["CVAT_LINK"]
-            + f'/tasks/{row["task_id"]}/jobs/{int(row["job_id"])}?frame={row["image_id"]}',
-        }
-        processed_image_data[image_path]["gt_detections"].append(gt_data)
 
-    for image_path, data_for_image in processed_image_data.items():
-        w, h = data_for_image["size"]
-        preds_on_image = all_predictions_dict.get(data_for_image["image_name"], [])
-
-        for pred_raw in preds_on_image:
+    for img_p, data in img_data.items():
+        w, h = data["s"]
+        for pred_raw in all_predictions_dict.get(data["n"], []):
             if not all(k in pred_raw for k in ["label", "score", "bbox"]):
                 continue
-
-            pred_label_canonical = map_prediction_label_to_canonical(pred_raw["label"])
-            if (
-                pred_label_canonical not in target_model_labels_for_csv
-            ):  # Только предсказания релевантных классов
+            pred_l_canon = map_prediction_label_to_canonical(pred_raw["label"])
+            if pred_l_canon not in target_model_labels:
                 continue
 
-            group = get_group_for_label(pred_label_canonical)
-            if group in config_params["SIZE_REQUIREMENTS"]:
-                min_w, min_h = config_params["SIZE_REQUIREMENTS"][group]
-                x1p, y1p, x2p, y2p = pred_raw[
-                    "bbox"
-                ]  # Предполагаем абсолютные координаты
-                if (x2p - x1p) < min_w or (y2p - y1p) < min_h:
+            grp = get_group_for_label(pred_l_canon)
+            if grp in config_params["SIZE_REQUIREMENTS"]:
+                mw, mh = config_params["SIZE_REQUIREMENTS"][grp]
+                x1p_abs, y1p_abs, x2p_abs, y2p_abs = pred_raw["bbox"]
+                if (x2p_abs - x1p_abs) < mw or (y2p_abs - y1p_abs) < mh:
                     continue
 
-            x1p, y1p, x2p, y2p = pred_raw["bbox"]
-            pred_data = {
-                "label": pred_label_canonical,
-                "bounding_box": [x1p / w, y1p / h, (x2p - x1p) / w, (y2p - y1p) / h],
-                "confidence": pred_raw["score"],
-                "box_width_abs": float(x2p - x1p),
-                "box_height_abs": float(y2p - y1p),
-            }
-            data_for_image["pred_detections"].append(pred_data)
+            x1p_abs, y1p_abs, x2p_abs, y2p_abs = pred_raw["bbox"]
+            data["preds"].append(
+                {
+                    "label": pred_l_canon,
+                    "bounding_box": [
+                        x1p_abs / w,
+                        y1p_abs / h,
+                        (x2p_abs - x1p_abs) / w,
+                        (y2p_abs - y1p_abs) / h,
+                    ],
+                    "confidence": pred_raw["score"],
+                    "box_width_abs": float(x2p_abs - x1p_abs),
+                    "box_height_abs": float(y2p_abs - y1p_abs),
+                }
+            )
 
-    samples_to_add = [
-        fo.Sample(
-            filepath=fp,
-            ground_truth=fo.Detections(
-                detections=[fo.Detection(**d) for d in data["gt_detections"]]
-            ),
-            predictions=fo.Detections(
-                detections=[fo.Detection(**d) for d in data["pred_detections"]]
-            ),
+    samples = []
+    for fp, data in img_data.items():
+        if not data["gts"]:
+            continue
+        gt_dets = [fo.Detection(**gt_data) for gt_data in data["gts"]]
+        pred_dets = [fo.Detection(**pred_data) for pred_data in data["preds"]]
+        samples.append(
+            fo.Sample(
+                filepath=fp,
+                ground_truth=fo.Detections(detections=gt_dets),
+                predictions=fo.Detections(detections=pred_dets),
+            )
         )
-        for fp, data in processed_image_data.items()
-        if data["gt_detections"]  # Только если есть GT для этого класса
-    ]
 
-    if samples_to_add:
-        dataset.add_samples(samples_to_add)
-        logger.info(
-            f"Добавлено {len(samples_to_add)} сэмплов в датасет {dataset_name}."
-        )
+    if samples:
+        dataset.add_samples(samples)
+        logger.info(f"Добавлено {len(samples)} сэмплов в датасет {dataset_name}.")
     else:
-        logger.warning(
-            f"Нет валидных данных (с GT для класса {our_class_name_from_csv}) для датасета {dataset_name}."
-        )
-        return dataset  # Возвращаем, возможно, пустой датасет
+        logger.warning(f"Нет валидных данных для датасета {dataset_name}.")
+        return dataset
 
-    # --- ОЦЕНКА ---
     if our_class_name_from_csv in config_params["SKIP_CLASSES_FOR_IOU_EVAL"]:
         evaluate_by_inclusion(
             dataset,
@@ -413,12 +465,12 @@ def load_class_dataset_from_csv(csv_file, all_predictions_dict, config_params):
         )
     else:
         logger.info(
-            f"Класс {our_class_name_from_csv} НЕ в SKIP. Запуск стандартной оценки IoU."
+            f"Класс {our_class_name_from_csv} НЕ в SKIP. Стандартная оценка IoU."
         )
-        if dataset.count(f"ground_truth.detections") > 0:
+        if dataset.count("ground_truth.detections") > 0:
             for iou_thr, iou_tag in config_params["IOU_DICT"].items():
                 logger.info(
-                    f"Оценка для IoU={iou_thr} (ключ:{iou_tag}), класс для оценки: {display_gt_label_for_dataset}"
+                    f"Оценка IoU={iou_thr} (ключ:{iou_tag}), класс для оценки: {display_gt_label}"
                 )
                 try:
                     dataset.evaluate_detections(
@@ -428,41 +480,38 @@ def load_class_dataset_from_csv(csv_file, all_predictions_dict, config_params):
                         method="coco",
                         iou=iou_thr,
                         compute_mAP=False,
-                        classes=[display_gt_label_for_dataset],
+                        classes=[display_gt_label],
                         progress=True,
                     )
                 except Exception as e:
                     logger.error(
-                        f"Ошибка оценки IoU={iou_thr} для {our_class_name_from_csv} (метка {display_gt_label_for_dataset}): {e}"
+                        f"Ошибка оценки IoU={iou_thr} для {our_class_name_from_csv} ({display_gt_label}): {e}"
                     )
         else:
             logger.warning(
                 f"Пропуск оценки IoU для {our_class_name_from_csv}: нет GT детекций."
             )
 
-    # --- ВЫЧИСЛЕНИЕ ЭМБЕДДИНГОВ ---
     if config_params["COMPUTE_GT_EMBEDDINGS"]:
-        if config_params["PATH_TO_EMBEDDINGS_MODEL"] and os.path.isdir(
-            config_params["PATH_TO_EMBEDDINGS_MODEL"]
-        ):
-            logger.info(
-                f"Вычисление эмбеддингов для GT объектов датасета {dataset_name}..."
-            )
+        path_emb_model = config_params["PATH_TO_EMBEDDINGS_MODEL"]
+        if path_emb_model and os.path.isdir(path_emb_model):
+            logger.info(f"Вычисление эмбеддингов GT для {dataset_name}...")
             compute_and_save_patch_embeddings(
                 dataset,
-                model_path=config_params["PATH_TO_EMBEDDINGS_MODEL"],
+                model_path=path_emb_model,
                 patches_field="ground_truth",
                 embeddings_storage_field=config_params["EMBEDDINGS_FIELD_SUFFIX"],
+                # zoo_model_name_for_type не передается, т.к. HuggingFaceEmbedder его не использует
             )
         else:
             logger.warning(
-                f"Путь к модели эмбеддингов не указан/некорректен: {config_params['PATH_TO_EMBEDDINGS_MODEL']}. Пропуск."
+                f"Путь к модели эмбеддингов не указан/некорректен: {path_emb_model}. Пропуск."
             )
 
-    logger.info(f"Датасет {dataset_name} обработан и сохранен.")
-    if config_params["LAUNCH_APP_FOR_EACH"] and samples_to_add:
+    logger.info(f"Датасет {dataset_name} обработан.")
+    if config_params["LAUNCH_APP_FOR_EACH"] and samples:
         logger.info(
-            f"Запуск FiftyOne App для {dataset_name} на порту {config_params['current_port']}..."
+            f"Запуск App для {dataset_name} на порту {config_params['current_port']}..."
         )
         try:
             fo.launch_app(
@@ -472,23 +521,23 @@ def load_class_dataset_from_csv(csv_file, all_predictions_dict, config_params):
                 auto=False,
             )
             logger.info(
-                f"FiftyOne App доступен: http://<ваш_ip>:{config_params['current_port']}"
+                f"App доступен: http://<ваш_ip>:{config_params['current_port']}"
             )
         except Exception as e:
-            logger.error(f"Не удалось запустить FiftyOne App для {dataset_name}: {e}")
+            logger.error(f"Не удалось запустить App для {dataset_name}: {e}")
     return dataset
 
 
 # --- ОСНОВНАЯ ФУНКЦИЯ ---
 def main():
-    # --- Настройки выполнения ---
-    # (Эти параметры можно также вынести в config.py или передавать через CLI)
     APP_CONFIG = {
-        "LAUNCH_APP_FOR_EACH": False,  # Открывать ли браузер для каждого датасета
-        "COMPUTE_GT_EMBEDDINGS": True,  # Вычислять ли эмбеддинги для GT патчей
-        "EMBEDDINGS_MODEL_SUBDIR": "clip-vit-base-patch32",  # Поддиректория модели в LOCAL_MODELS_DIR
-        "EMBEDDINGS_FIELD_SUFFIX": "clip_embeddings",  # Суффикс для поля с эмбеддингами
-        "START_PORT": 30082,  # Начальный порт для FiftyOne App
+        "LAUNCH_APP_FOR_EACH": False,
+        "COMPUTE_GT_EMBEDDINGS": True,
+        "EMBEDDINGS_MODEL_SUBDIR": "dinov2-vitb14",
+        "EMBEDDINGS_FIELD_SUFFIX": "dinov2b14_embeddings",
+        # "EMBEDDINGS_MODEL_SUBDIR": "clip-vit-base32",
+        # "EMBEDDINGS_FIELD_SUFFIX": "clip_vitb32_embeddings",
+        "START_PORT": 30082,
     }
     APP_CONFIG["PATH_TO_EMBEDDINGS_MODEL"] = os.path.join(
         LOCAL_MODELS_DIR, APP_CONFIG["EMBEDDINGS_MODEL_SUBDIR"]
@@ -498,14 +547,11 @@ def main():
         APP_CONFIG["PATH_TO_EMBEDDINGS_MODEL"]
     ):
         logger.warning(
-            f"Директория с локальной моделью для эмбеддингов не найдена: {APP_CONFIG['PATH_TO_EMBEDDINGS_MODEL']}"
+            f"Директория модели эмбеддингов не найдена: {APP_CONFIG['PATH_TO_EMBEDDINGS_MODEL']}. Эмбеддинги не будут вычислены."
         )
-        logger.warning("Вычисление эмбеддингов будет пропущено.")
         APP_CONFIG["COMPUTE_GT_EMBEDDINGS"] = False
 
-    # Передача глобальных констант и настроек в функцию обработки
-    # чтобы избежать использования global или слишком много параметров
-    SCRIPT_PARAMS_FOR_LOADER = {
+    LOADER_PARAMS = {
         "CVAT_LINK": CVAT_LINK,
         "SIZE_REQUIREMENTS": SIZE_REQUIREMENTS,
         "SKIP_CLASSES_FOR_IOU_EVAL": SKIP_CLASSES_FOR_IOU_EVAL,
@@ -515,69 +561,61 @@ def main():
         "PATH_TO_EMBEDDINGS_MODEL": APP_CONFIG["PATH_TO_EMBEDDINGS_MODEL"],
         "EMBEDDINGS_FIELD_SUFFIX": APP_CONFIG["EMBEDDINGS_FIELD_SUFFIX"],
         "LAUNCH_APP_FOR_EACH": APP_CONFIG["LAUNCH_APP_FOR_EACH"],
-        # current_port будет добавляться в цикле
     }
 
     try:
         with open(PATH_TO_PREDICTIONS, "r") as f:
-            all_predictions_dict = json.load(f)
+            all_preds = json.load(f)
     except FileNotFoundError:
-        logger.critical(f"Файл с предсказаниями не найден: {PATH_TO_PREDICTIONS}")
+        logger.critical(f"Предсказания не найдены: {PATH_TO_PREDICTIONS}")
         return
     except json.JSONDecodeError:
-        logger.critical(f"Не удалось декодировать JSON из файла: {PATH_TO_PREDICTIONS}")
+        logger.critical(f"Ошибка декодирования JSON: {PATH_TO_PREDICTIONS}")
         return
 
     csv_files = sorted(glob.glob(os.path.join(PATH_TO_SPLIT, "*.csv")))
     if not csv_files:
-        logger.warning(f"CSV файлы не найдены в {PATH_TO_SPLIT}")
+        logger.warning(f"CSV не найдены в {PATH_TO_SPLIT}")
         return
 
     loaded_datasets_summary = []
-    for i, csv_file in enumerate(csv_files):
-        SCRIPT_PARAMS_FOR_LOADER["current_port"] = APP_CONFIG["START_PORT"] + i
-
-        dataset = load_class_dataset_from_csv(
-            csv_file, all_predictions_dict, SCRIPT_PARAMS_FOR_LOADER
-        )
-        if dataset:
-            summary = {"name": dataset.name, "has_embeddings": False}
-            if APP_CONFIG["COMPUTE_GT_EMBEDDINGS"] and dataset.has_field(
+    for i, csv_f in enumerate(csv_files):
+        LOADER_PARAMS["current_port"] = APP_CONFIG["START_PORT"] + i
+        ds = load_class_dataset_from_csv(csv_f, all_preds, LOADER_PARAMS)
+        if ds:
+            info = {"name": ds.name, "emb": False}
+            if APP_CONFIG["COMPUTE_GT_EMBEDDINGS"] and ds.has_field(
                 f"ground_truth_{APP_CONFIG['EMBEDDINGS_FIELD_SUFFIX']}"
             ):
-                summary["has_embeddings"] = True
-            if APP_CONFIG["LAUNCH_APP_FOR_EACH"] and dataset.count() > 0:
-                summary["app_launched_port"] = SCRIPT_PARAMS_FOR_LOADER["current_port"]
-            loaded_datasets_summary.append(summary)
-            if APP_CONFIG["LAUNCH_APP_FOR_EACH"] and dataset and dataset.count() > 0:
-                logger.info(
-                    f"Обработка {dataset.name} завершена. Для продолжения закройте вкладку/консоль FiftyOne или нажмите Ctrl+C, если скрипт ожидает."
-                )
-                # input("Нажмите Enter для следующего файла...") # Для пошагового режима
+                info["emb"] = True
+            if APP_CONFIG["LAUNCH_APP_FOR_EACH"] and ds.count() > 0:
+                info["app_port"] = LOADER_PARAMS["current_port"]
+            loaded_datasets_summary.append(info)
+            if APP_CONFIG["LAUNCH_APP_FOR_EACH"] and ds and ds.count() > 0:
+                logger.info(f"Обработка {ds.name} завершена.")
 
     logger.info("\n=== Обработка всех CSV завершена ===")
     if loaded_datasets_summary:
         logger.info("Созданы/обновлены датасеты:")
         for info in loaded_datasets_summary:
-            msg = f"- {info['name']}"
-            if info["has_embeddings"]:
-                msg += " (с эмбеддингами GT)"
-            if "app_launched_port" in info:
-                msg += f" (App запущен на порту {info['app_launched_port']})"
+            msg = (
+                f"- {info['name']}"
+                + (" (с эмб. GT)" if info["emb"] else "")
+                + (f" (App на порту {info['app_port']})" if "app_port" in info else "")
+            )
             logger.info(msg)
-
-        logger.info("\nДля просмотра датасета вручную (если App не был запущен):")
-        logger.info("import fiftyone as fo")
-        logger.info(
-            f"dataset = fo.load_dataset('{loaded_datasets_summary[0]['name']}') # Замените на имя нужного датасета"
-        )
-        logger.info(
-            f"session = fo.launch_app(dataset, port={APP_CONFIG['START_PORT']})"
-        )
+        if loaded_datasets_summary:
+            logger.info(f"\nДля просмотра (если App не был запущен):")
+            logger.info(f"import fiftyone as fo")
+            logger.info(
+                f"dataset = fo.load_dataset('{loaded_datasets_summary[0]['name']}')"
+            )
+            logger.info(
+                f"session = fo.launch_app(dataset, port={APP_CONFIG['START_PORT']})"
+            )
     else:
         logger.warning("Не было создано ни одного датасета.")
 
 
 if __name__ == "__main__":
-    # fo.config.show_progress_bars = False # Отключить прогресс-бары FiftyOne (если мешают логам)
     main()
