@@ -4,14 +4,10 @@ import json
 import pandas as pd
 import numpy as np
 import fiftyone as fo
-import fiftyone.zoo as foz  # Для автоматической загрузки моделей
+import fiftyone.zoo as foz  # Используем для foz.load_zoo_model
 from loguru import logger
-from PIL import Image
-import torch
-from transformers import (
-    AutoImageProcessor,
-    AutoModel,
-)  # Останутся для кастомной обертки, если Zoo не сработает
+
+# PIL, torch, transformers импортируются неявно через fiftyone.zoo или fiftyone.core.models
 
 # --- НАСТРОЙКИ ЛОГИРОВАНИЯ (Минимальные) ---
 logger.remove()
@@ -20,7 +16,6 @@ logger.add(
     level="INFO",
     format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <level>{message}</level>",
 )
-# logger.add("processing_critical.log", level="ERROR") # Опционально: только ошибки в файл
 
 # --- ИМПОРТ КОНФИГУРАЦИИ ---
 try:
@@ -32,7 +27,6 @@ try:
         MODEL_MAPPING,
         CLASSES_GROUPS,
         CVAT_LINK,
-        # LOCAL_MODELS_DIR больше не нужен
     )
 except ImportError:
     logger.critical(
@@ -97,7 +91,7 @@ def calculate_intersection_area(bbox1_abs, bbox2_abs):
     return (x_right - x_left) * (y_bottom - y_top)
 
 
-# --- КАСТОМНАЯ ОЦЕНКА ПО ВХОЖДЕНИЮ (Без существенных изменений в логике, только логи) ---
+# --- КАСТОМНАЯ ОЦЕНКА ПО ВХОЖДЕНИЮ (Без изменений) ---
 def evaluate_by_inclusion(
     dataset, gt_field="ground_truth", pred_field="predictions", gt_covered_threshold=0.8
 ):
@@ -167,7 +161,7 @@ def evaluate_by_inclusion(
     logger.info(f"Оценка по вхождению для '{dataset.name}' завершена.")
 
 
-# --- ВЫЧИСЛЕНИЕ ЭМБЕДДИНГОВ ПАТЧЕЙ (Используем автоматическую загрузку из Zoo) ---
+# --- ВЫЧИСЛЕНИЕ ЭМБЕДДИНГОВ ПАТЧЕЙ (Возвращаем foz.load_zoo_model) ---
 def compute_and_save_patch_embeddings(
     dataset_or_view,
     zoo_model_name,  # Имя модели из FiftyOne Zoo (например, "dinov2-vitb14-torch")
@@ -197,10 +191,15 @@ def compute_and_save_patch_embeddings(
             )
             return
 
-        # Используем fo.compute_embeddings с именем модели из Zoo.
-        # FiftyOne/PyTorch Hub должны сами справиться с загрузкой.
+        # --- Загружаем модель через foz.load_zoo_model ---
+        # Это должно автоматически загрузить модель из сети, если ее нет в кэше.
+        # Параметры, такие как `model_name_or_path`, здесь не нужны,
+        # так как мы используем стандартное имя из Zoo.
+        model_instance = foz.load_zoo_model(zoo_model_name)
+        # -------------------------------------------------
+
         dataset_or_view.compute_embeddings(
-            zoo_model_name,  # Передаем имя модели из Zoo
+            model_instance,  # Передаем загруженный экземпляр модели
             embeddings_field=final_embeddings_field,
             patches_field=patches_field,
             batch_size=16,
@@ -219,7 +218,7 @@ def compute_and_save_patch_embeddings(
         )
 
 
-# --- ЗАГРУЗКА ДАННЫХ И СОЗДАНИЕ ДАТАСЕТА ДЛЯ КЛАССА (Минимальные изменения в логике, только логи) ---
+# --- ЗАГРУЗКА ДАННЫХ И СОЗДАНИЕ ДАТАСЕТА ДЛЯ КЛАССА (Без изменений) ---
 def load_class_dataset_from_csv(csv_file, all_predictions_dict, config_params):
     our_class_name_from_csv = os.path.splitext(os.path.basename(csv_file))[0]
     logger.info(
@@ -227,7 +226,7 @@ def load_class_dataset_from_csv(csv_file, all_predictions_dict, config_params):
     )
     dataset_name = our_class_name_from_csv
     if dataset_name in fo.list_datasets():
-        fo.delete_dataset(dataset_name)  # Молча удаляем, если существует
+        fo.delete_dataset(dataset_name)
     dataset = fo.Dataset(dataset_name, persistent=True)
 
     try:
@@ -336,6 +335,7 @@ def load_class_dataset_from_csv(csv_file, all_predictions_dict, config_params):
     dataset.add_samples(samples)
     logger.info(f"Добавлено {len(samples)} сэмплов в '{dataset_name}'.")
 
+    # Сначала считаем метрики
     if our_class_name_from_csv in config_params["SKIP_CLASSES_FOR_IOU_EVAL"]:
         evaluate_by_inclusion(
             dataset,
@@ -345,6 +345,9 @@ def load_class_dataset_from_csv(csv_file, all_predictions_dict, config_params):
         if dataset.count("ground_truth.detections") > 0:
             for iou_thr, iou_tag in config_params["IOU_DICT"].items():
                 try:
+                    logger.info(
+                        f"Оценка IoU={iou_thr} для '{our_class_name_from_csv}' (метка: {display_gt_label})"
+                    )
                     dataset.evaluate_detections(
                         "predictions",
                         gt_field="ground_truth",
@@ -364,6 +367,7 @@ def load_class_dataset_from_csv(csv_file, all_predictions_dict, config_params):
                 f"Пропуск оценки IoU для '{our_class_name_from_csv}': нет GT."
             )
 
+    # Затем считаем эмбеддинги
     if config_params["COMPUTE_GT_EMBEDDINGS"]:
         logger.info(f"Вычисление эмбеддингов GT для '{dataset_name}'...")
         compute_and_save_patch_embeddings(
@@ -395,15 +399,11 @@ def main():
     APP_CONFIG = {
         "LAUNCH_APP_FOR_EACH": False,
         "COMPUTE_GT_EMBEDDINGS": True,
-        # Имя модели из FiftyOne Zoo для эмбеддингов.
-        # Убедитесь, что оно есть в выводе `print(foz.list_downloadable_models(tags="embedding"))`
         "ZOO_MODEL_NAME_FOR_EMBEDDINGS": "dinov2-vitb14-torch",
-        # "ZOO_MODEL_NAME_FOR_EMBEDDINGS": "clip-vit-base32-torch", # Альтернатива
-        "EMBEDDINGS_FIELD_SUFFIX": "embeddings",  # Простой суффикс
+        # "ZOO_MODEL_NAME_FOR_EMBEDDINGS": "clip-vit-base32-torch", # Убедитесь, что это имя есть в foz.list_zoo_models()
+        "EMBEDDINGS_FIELD_SUFFIX": "embeddings",
         "START_PORT": 30082,
     }
-
-    # PATH_TO_EMBEDDINGS_MODEL и EMBEDDINGS_MODEL_SUBDIR больше не нужны, т.к. модель грузится из Zoo
 
     LOADER_PARAMS = {
         "CVAT_LINK": CVAT_LINK,
@@ -412,9 +412,7 @@ def main():
         "INCLUSION_THRESHOLD_GT_COVERED": INCLUSION_THRESHOLD_GT_COVERED,
         "IOU_DICT": IOU_DICT,
         "COMPUTE_GT_EMBEDDINGS": APP_CONFIG["COMPUTE_GT_EMBEDDINGS"],
-        "ZOO_MODEL_NAME_FOR_EMBEDDINGS": APP_CONFIG[
-            "ZOO_MODEL_NAME_FOR_EMBEDDINGS"
-        ],  # Передаем имя модели Zoo
+        "ZOO_MODEL_NAME_FOR_EMBEDDINGS": APP_CONFIG["ZOO_MODEL_NAME_FOR_EMBEDDINGS"],
         "EMBEDDINGS_FIELD_SUFFIX": APP_CONFIG["EMBEDDINGS_FIELD_SUFFIX"],
         "LAUNCH_APP_FOR_EACH": APP_CONFIG["LAUNCH_APP_FOR_EACH"],
     }
@@ -447,7 +445,6 @@ def main():
             if APP_CONFIG["LAUNCH_APP_FOR_EACH"] and ds.count() > 0:
                 info["app_port"] = LOADER_PARAMS["current_port"]
             loaded_datasets_summary.append(info)
-            # if APP_CONFIG["LAUNCH_APP_FOR_EACH"] and ds and ds.count() > 0: # Убрал ожидание input
 
     logger.info("\n=== Обработка всех CSV завершена ===")
     if loaded_datasets_summary:
@@ -473,5 +470,4 @@ def main():
 
 
 if __name__ == "__main__":
-    # fo.config.show_progress_bars = False # Можно раскомментировать, чтобы убрать прогресс-бары FO
     main()
